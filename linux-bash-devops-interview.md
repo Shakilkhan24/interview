@@ -340,8 +340,21 @@ create_backup() {
     esac
     
     # Verify backup integrity
-    if [ -f "$dest/$(basename $source).tar."* ]; then
-        tar -tzf "$dest/$(basename $source).tar."* > /dev/null 2>&1
+    local backup_file=""
+    case $COMPRESSION in
+        gzip)
+            backup_file="$dest/$(basename $source).tar.gz"
+            ;;
+        bzip2)
+            backup_file="$dest/$(basename $source).tar.bz2"
+            ;;
+        xz)
+            backup_file="$dest/$(basename $source).tar.xz"
+            ;;
+    esac
+    
+    if [ -f "$backup_file" ]; then
+        tar -tzf "$backup_file" > /dev/null 2>&1
         if [ $? -eq 0 ]; then
             echo "✓ Backup verified: $source"
         else
@@ -1998,6 +2011,16 @@ APP_DIR="/opt/$APP_NAME"
 BACKUP_DIR="/opt/backups/$APP_NAME"
 DEPLOY_USER="deploy"
 VERSION=${1:-latest}
+LOG_FILE="/var/log/${APP_NAME}-deploy.log"
+
+# Logging function
+log() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "[$timestamp] $message" | tee -a "$LOG_FILE"
+}
 
 # Functions
 backup_current_version() {
@@ -2385,12 +2408,16 @@ check_users() {
     log_audit "=== Checking User Accounts ==="
     
     # Users without password
-    awk -F: '($2 == "" ) { print $1 }' /etc/shadow && \
-        log_audit "WARNING: Users without password found"
+    local users_no_pass=$(awk -F: '($2 == "" ) { print $1 }' /etc/shadow)
+    if [ -n "$users_no_pass" ]; then
+        log_audit "WARNING: Users without password found: $users_no_pass"
+    fi
     
     # UID 0 accounts (should only be root)
-    awk -F: '($3 == 0) { print $1 }' /etc/passwd | grep -v "^root$" && \
-        log_audit "WARNING: Multiple UID 0 accounts found"
+    local uid0_accounts=$(awk -F: '($3 == 0) { print $1 }' /etc/passwd | grep -v "^root$")
+    if [ -n "$uid0_accounts" ]; then
+        log_audit "WARNING: Multiple UID 0 accounts found: $uid0_accounts"
+    fi
 }
 
 # 5. Apply security hardening
