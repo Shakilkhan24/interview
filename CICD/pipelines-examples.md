@@ -254,6 +254,8 @@ pipeline {
         NODE_VERSION = '18'
         AWS_REGION = 'us-east-1'
         NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
+        CLOUDFRONT_DIST_ID_STAGING = credentials('cloudfront-dist-id-staging')
+        CLOUDFRONT_DIST_ID_PROD = credentials('cloudfront-dist-id-prod')
     }
     
     parameters {
@@ -1633,7 +1635,7 @@ jobs:
     name: Build Application
     runs-on: ubuntu-latest
     outputs:
-      image-tag: ${{ steps.meta.outputs.tags }}
+      image-tag: ${{ steps.image-tag.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
     
     steps:
@@ -1645,6 +1647,15 @@ jobs:
         run: |
           VERSION=$(git describe --tags --always)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Generate image tag
+        id: image-tag
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          BRANCH_NAME=${BRANCH_NAME//\//-}
+          # Use full SHA to match metadata-action format: branch-sha
+          IMAGE_TAG="${BRANCH_NAME}-${GITHUB_SHA}"
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
       
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -1777,7 +1788,7 @@ jobs:
   notify:
     name: Notify Team
     runs-on: ubuntu-latest
-    needs: [deploy-development, deploy-staging, deploy-production]
+    needs: [build, deploy-development, deploy-staging, deploy-production]
     if: always()
     
     steps:
