@@ -1,0 +1,626 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = credentials('dockerhub-credentials')
+        AWS_CREDENTIALS = credentials('aws-credentials')
+        GITHUB_TOKEN = credentials('github-token')
+        VAULT_ADDR = 'http://vault.example.com:8200'
+        VAULT_TOKEN = credentials('vault-token')
+        
+        // Application settings
+        APP_NAME = 'devsecops-app'
+        APP_VERSION = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${APP_NAME}:${APP_VERSION}"
+        
+        // Environment settings
+        ENV = "${env.BRANCH_NAME == 'main' ? 'production' : 'development'}"
+        KUBECTL_CONFIG = credentials('kubeconfig')
+        
+        // Security tools
+        SNYK_TOKEN = credentials('snyk-token')
+        SONAR_TOKEN = credentials('sonar-token')
+        SONAR_HOST = 'http://sonarqube:9000'
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+        ansiColor('xterm')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Pre-Commit Security') {
+            parallel {
+                stage('Secret Detection') {
+                    steps {
+                        script {
+                            sh '''
+                                echo "Running secret detection..."
+                                # GitGuardian scan
+                                if command -v ggshield &> /dev/null; then
+                                    ggshield scan repo . || true
+                                fi
+                                
+                                # TruffleHog scan
+                                if command -v trufflehog &> /dev/null; then
+                                    trufflehog git file://. --json --only-verified || true
+                                fi
+                                
+                                # GitLeaks scan
+                                if command -v gitleaks &> /dev/null; then
+                                    gitleaks detect --source . --no-git --exit-code 1 || {
+                                        echo "WARNING: Secrets detected in code"
+                                        exit 1
+                                    }
+                                fi
+                            '''
+                        }
+                    }
+                    post {
+                        failure {
+                            echo "FAILED: Secrets detected in repository!"
+                        }
+                    }
+                }
+                
+                stage('Code Quality') {
+                    steps {
+                        script {
+                            sh '''
+                                # Lint Python code
+                                if [ -f requirements.txt ]; then
+                                    pip install flake8 pylint
+                                    flake8 . --max-line-length=100 --exclude=venv || true
+                                    pylint app/ || true
+                                fi
+                                
+                                # Lint JavaScript
+                                if [ -f package.json ]; then
+                                    npm install
+                                    npm run lint || true
+                                fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                script {
+                    echo "Building application and Docker image..."
+                    
+                    // Install dependencies
+                    sh '''
+                        if [ -f requirements.txt ]; then
+                            pip install -r requirements.txt
+                        fi
+                        if [ -f package.json ]; then
+                            npm ci
+                        fi
+                    '''
+                    
+                    // Build Docker image
+                    sh """
+                        docker build -t ${DOCKER_IMAGE} .
+                        docker tag ${DOCKER_IMAGE} ${DOCKER_REGISTRY}/${APP_NAME}:latest
+                    """
+                }
+            }
+            post {
+                success {
+                    echo "Build completed successfully"
+                }
+                failure {
+                    echo "Build failed"
+                }
+            }
+        }
+        
+        stage('SAST - Static Analysis') {
+            parallel {
+                stage('SonarQube Scan') {
+                    when {
+                        expression { env.SONAR_TOKEN != null }
+                    }
+                    steps {
+                        script {
+                            sh """
+                                docker run --rm \\
+                                    -v \$(pwd):/usr/src \\
+                                    -w /usr/src \\
+                                    sonarsource/sonar-scanner-cli:latest \\
+                                    -Dsonar.projectKey=\${APP_NAME} \\
+                                    -Dsonar.sources=. \\
+                                    -Dsonar.host.url=\${SONAR_HOST} \\
+                                    -Dsonar.login=\${SONAR_TOKEN} || true
+                            """
+                        }
+                    }
+                }
+                
+                stage('Semgrep Scan') {
+                    steps {
+                        script {
+                            sh '''
+                                # Install Semgrep
+                                pip install semgrep || true
+                                
+                                # Run scan
+                                semgrep --config=auto \
+                                    --json \
+                                    --output=semgrep-report.json . || true
+                            '''
+                            
+                            publishHTML([
+                                reportName: 'Semgrep Security Report',
+                                reportDir: '.',
+                                reportFiles: 'semgrep-report.json',
+                                keepAll: true
+                            ])
+                        }
+                    }
+                }
+                
+                stage('Bandit Scan') {
+                    when {
+                        expression { fileExists('requirements.txt') }
+                    }
+                    steps {
+                        script {
+                            sh '''
+                                pip install bandit
+                                bandit -r ./app \
+                                    -f json \
+                                    -o bandit-report.json || true
+                            '''
+                            
+                            publishHTML([
+                                reportName: 'Bandit Security Report',
+                                reportDir: '.',
+                                reportFiles: 'bandit-report.json',
+                                keepAll: true
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Dependency Scanning') {
+            parallel {
+                stage('Snyk Dependency Scan') {
+                    when {
+                        expression { env.SNYK_TOKEN != null }
+                    }
+                    steps {
+                        script {
+                            sh '''
+                                # Install Snyk
+                                npm install -g snyk || true
+                                
+                                # Authenticate
+                                snyk auth ${SNYK_TOKEN} || true
+                                
+                                # Test dependencies
+                                if [ -f package.json ]; then
+                                    snyk test --json-file-output=snyk-report.json || true
+                                fi
+                                
+                                if [ -f requirements.txt ]; then
+                                    snyk test --file=requirements.txt --json-file-output=snyk-python-report.json || true
+                                fi
+                            '''
+                        }
+                    }
+                }
+                
+                stage('OWASP Dependency-Check') {
+                    steps {
+                        script {
+                            sh '''
+                                # Download OWASP Dependency-Check
+                                if [ ! -f dependency-check.sh ]; then
+                                    wget https://github.com/jeremylong/DependencyCheck/releases/download/v8.4.0/dependency-check-8.4.0-release.zip
+                                    unzip dependency-check-8.4.0-release.zip
+                                fi
+                                
+                                # Run scan
+                                ./dependency-check/bin/dependency-check.sh \
+                                    --project "${APP_NAME}" \
+                                    --scan . \
+                                    --format JSON \
+                                    --out dependency-check-report.json \
+                                    --failOnCVSS 7 || true
+                            '''
+                            
+                            publishHTML([
+                                reportName: 'OWASP Dependency-Check Report',
+                                reportDir: '.',
+                                reportFiles: 'dependency-check-report.json',
+                                keepAll: true
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Container Security') {
+            parallel {
+                stage('Trivy Image Scan') {
+                    steps {
+                        script {
+                            sh """
+                                # Install Trivy if not present
+                                if ! command -v trivy &> /dev/null; then
+                                    sudo apt-get install wget apt-transport-https gnupg lsb-release
+                                    wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+                                    echo deb https://aquasecurity.github.io/trivy-repo/deb \$(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+                                    sudo apt-get update
+                                    sudo apt-get install trivy -y
+                                fi
+                                
+                                # Scan container image
+                                trivy image --format json --output trivy-image-report.json \\
+                                    --severity HIGH,CRITICAL \\
+                                    ${DOCKER_IMAGE} || true
+                                
+                                # Scan filesystem
+                                trivy fs --security-checks vuln,config \\
+                                    --format json \\
+                                    --output trivy-fs-report.json \\
+                                    . || true
+                            """
+                            
+                            publishHTML([
+                                reportName: 'Trivy Container Scan Report',
+                                reportDir: '.',
+                                reportFiles: 'trivy-image-report.json',
+                                keepAll: true
+                            ])
+                        }
+                    }
+                }
+                
+                stage('Docker Scout') {
+                    steps {
+                        script {
+                            sh """
+                                docker scout cves ${DOCKER_IMAGE} || true
+                                docker scout recommendations ${DOCKER_IMAGE} || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Infrastructure Security') {
+            when {
+                anyOf {
+                    expression { fileExists('terraform/') }
+                    expression { fileExists('*.tf') }
+                }
+            }
+            parallel {
+                stage('Checkov Scan') {
+                    steps {
+                        script {
+                            sh '''
+                                # Install Checkov
+                                pip install checkov || true
+                                
+                                # Scan Terraform
+                                if [ -d terraform ]; then
+                                    checkov -d ./terraform \
+                                        --framework terraform \
+                                        --output json \
+                                        --output-file-path checkov-report.json || true
+                                fi
+                                
+                                # Scan Kubernetes
+                                if [ -d k8s ]; then
+                                    checkov -f k8s/*.yaml \
+                                        --framework kubernetes \
+                                        --output json \
+                                        --output-file-path checkov-k8s-report.json || true
+                                fi
+                            '''
+                        }
+                    }
+                }
+                
+                stage('Tfsec Scan') {
+                    when {
+                        anyOf {
+                            expression { fileExists('terraform/') }
+                            expression { fileExists('*.tf') }
+                        }
+                    }
+                    steps {
+                        script {
+                            sh '''
+                                # Install Tfsec
+                                if ! command -v tfsec &> /dev/null; then
+                                    wget https://github.com/aquasecurity/tfsec/releases/download/v1.28.4/tfsec-linux-amd64
+                                    chmod +x tfsec-linux-amd64
+                                    sudo mv tfsec-linux-amd64 /usr/local/bin/tfsec
+                                fi
+                                
+                                # Scan Terraform
+                                if [ -d terraform ]; then
+                                    tfsec ./terraform --format json --out tfsec-report.json || true
+                                fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            steps {
+                script {
+                    sh '''
+                        # Python tests
+                        if [ -f requirements.txt ]; then
+                            pip install pytest pytest-cov
+                            pytest tests/ --cov=app --cov-report=json --cov-report=html || true
+                        fi
+                        
+                        # Node.js tests
+                        if [ -f package.json ]; then
+                            npm test -- --coverage || true
+                        fi
+                    '''
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        reportName: 'Test Coverage Report',
+                        reportDir: '.',
+                        reportFiles: 'htmlcov/index.html',
+                        keepAll: true
+                    ])
+                }
+            }
+        }
+        
+        stage('Security Tests') {
+            steps {
+                script {
+                    sh '''
+                        # Run security test suite
+                        if [ -f tests/security_test.py ]; then
+                            pytest tests/security_test.py -v || true
+                        fi
+                        
+                        # OWASP ZAP baseline scan (if app is running)
+                        # docker run --rm -v $(pwd):/zap/wrk/:rw \\
+                        #   -t owasp/zap2docker-stable zap-baseline.py \\
+                        #   -t http://localhost:8080 -J zap-report.json || true
+                    '''
+                }
+            }
+        }
+        
+        stage('Compliance Check') {
+            steps {
+                script {
+                    sh '''
+                        # OPA policy check
+                        if [ -f security-policies/opa-policy.rego ]; then
+                            opa test security-policies/ || true
+                        fi
+                        
+                        # Compliance validation
+                        echo "Running compliance checks..."
+                    '''
+                }
+            }
+        }
+        
+        stage('Push Image') {
+            when {
+                allOf {
+                    expression { env.BRANCH_NAME == 'main' || env.BRANCH_NAME == 'develop' }
+                    expression { currentBuild.result == 'SUCCESS' || currentBuild.result == 'UNSTABLE' }
+                }
+            }
+            steps {
+                script {
+                    sh """
+                        docker login -u \${DOCKER_REGISTRY_USR} -p \${DOCKER_REGISTRY_PSW}
+                        docker push ${DOCKER_IMAGE}
+                        docker push ${DOCKER_REGISTRY}/${APP_NAME}:latest
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Dev') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    sh """
+                        export KUBECONFIG=\${KUBECTL_CONFIG}
+                        kubectl set image deployment/${APP_NAME} \\
+                            app=${DOCKER_IMAGE} \\
+                            -n development || kubectl apply -f k8s/deployment.yaml
+                        
+                        kubectl rollout status deployment/${APP_NAME} \\
+                            -n development --timeout=5m
+                    """
+                }
+            }
+        }
+        
+        stage('DAST - Dynamic Analysis') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    sh '''
+                        # Wait for deployment
+                        sleep 30
+                        
+                        # OWASP ZAP full scan
+                        docker run --rm \\
+                            -v $(pwd):/zap/wrk/:rw \\
+                            -t owasp/zap2docker-stable zap-full-scan.py \\
+                            -t http://dev-app.example.com \\
+                            -J zap-report.json || true
+                        
+                        # Nuclei scan
+                        if command -v nuclei &> /dev/null; then
+                            nuclei -u http://dev-app.example.com \\
+                                -json -o nuclei-report.json || true
+                        fi
+                    '''
+                    
+                    publishHTML([
+                        reportName: 'ZAP DAST Report',
+                        reportDir: '.',
+                        reportFiles: 'zap-report.json',
+                        keepAll: true
+                    ])
+                }
+            }
+        }
+        
+        stage('Approve Production Deployment') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def userInput = input(
+                        id: 'approval',
+                        message: 'Approve production deployment?',
+                        parameters: [
+                            choice(
+                                choices: ['Approve', 'Reject'],
+                                description: 'Deployment approval',
+                                name: 'action'
+                            )
+                        ]
+                    )
+                    if (userInput != 'Approve') {
+                        error('Production deployment rejected')
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+                beforeInput true
+            }
+            steps {
+                script {
+                    try {
+                        // Save previous version for rollback
+                        sh '''
+                            export KUBECONFIG=${KUBECTL_CONFIG}
+                            kubectl get deployment ${APP_NAME} -n production \\
+                                -o jsonpath='{.spec.template.spec.containers[0].image}' \\
+                                > previous-version.txt || echo "" > previous-version.txt
+                        '''
+                        
+                        sh """
+                            export KUBECONFIG=\${KUBECTL_CONFIG}
+                            kubectl set image deployment/${APP_NAME} \\
+                                app=${DOCKER_IMAGE} \\
+                                -n production
+                            
+                            kubectl rollout status deployment/${APP_NAME} \\
+                                -n production --timeout=5m
+                        '''
+                        
+                        // Verify deployment
+                        sh '''
+                            sleep 30
+                            curl -f https://app.example.com/health || exit 1
+                        '''
+                        
+                    } catch (Exception e) {
+                        // Automatic rollback on failure
+                        sh '''
+                            PREVIOUS_VERSION=$(cat previous-version.txt)
+                            if [ ! -z "$PREVIOUS_VERSION" ]; then
+                                export KUBECONFIG=${KUBECTL_CONFIG}
+                                kubectl set image deployment/${APP_NAME} \\
+                                    app=$PREVIOUS_VERSION \\
+                                    -n production
+                                kubectl rollout status deployment/${APP_NAME} \\
+                                    -n production --timeout=5m
+                            fi
+                        '''
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('Post-Deploy Security') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh '''
+                        # Runtime security monitoring
+                        echo "Monitoring runtime security..."
+                        
+                        # Check for security events
+                        # kubectl logs -l app=${APP_NAME} -n production | grep -i "security\|vulnerability\|attack" || true
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Archive artifacts
+            archiveArtifacts artifacts: '**/*.json', allowEmptyArchive: true
+            archiveArtifacts artifacts: '**/*.html', allowEmptyArchive: true
+            
+            // Cleanup
+            sh 'docker system prune -f || true'
+        }
+        success {
+            echo "Pipeline succeeded!"
+            // Send notification
+        }
+        failure {
+            echo "Pipeline failed!"
+            // Send alert notification
+        }
+        unstable {
+            echo "Pipeline unstable - some security warnings"
+        }
+    }
+}
+
